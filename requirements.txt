@@ -1,0 +1,47 @@
+# ============================================================
+# GoFed: Towards Energy-Accuracy Tradeoff in Abuse Classification Based on Optimum Parameter Selection
+#
+# Requirements File
+# Python >= 3.10 recommended
+# ============================================================
+
+# ── Deep Learning Framework ──────────────────────────────────
+# CPU-only build (default, works on any machine):
+torch>=2.0.0
+
+# GPU build — uncomment ONE of the following and comment the
+# CPU line above if you have a compatible NVIDIA GPU:
+#
+#   CUDA 11.8  (Ampere and older, sm_50 – sm_90):
+#   pip install torch>=2.0.0 --index-url https://download.pytorch.org/whl/cu118
+#
+#   CUDA 12.1  (Ampere / Ada Lovelace, sm_50 – sm_90):
+#   pip install torch>=2.0.0 --index-url https://download.pytorch.org/whl/cu121
+#
+#   CUDA 12.8 Nightly (Blackwell sm_120 — RTX PRO 3000 / RTX 50-series):
+#   pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu128
+
+# ── NLP / Transformers ───────────────────────────────────────
+# DistilBERT tokenizer + model backbone
+transformers>=4.36.0
+
+# Required by transformers for fast tokenizers
+tokenizers>=0.15.0
+
+# ── Data & Numerics ──────────────────────────────────────────
+numpy>=1.24.0
+pandas>=1.5.0
+
+# ── Evaluation Metrics ───────────────────────────────────────
+scikit-learn>=1.2.0
+
+# ── Standard Library (no install needed, listed for reference)
+# argparse  — CLI argument parsing
+# copy      — deep-copy of model parameters
+# csv       — metrics file writing
+# json      — config serialisation
+# logging   — runtime logging
+# math      — Shannon capacity / energy formulae
+# os        — path handling
+# pathlib   — path utilities
+# time      — timing local training
