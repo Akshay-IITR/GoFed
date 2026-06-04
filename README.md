@@ -17,6 +17,7 @@
 9. [Reproducing Paper Results]     (#9-reproducing-paper-results)
 10. [Energy Model]                 (#10-energy-model)
 11. [Troubleshooting]              (#11-troubleshooting)
+12. [Additional Experiment]
 
 ---
 
@@ -481,4 +482,67 @@ DistilBERT embedding generation dominates training time. For pipeline verificati
 python gofed.py --bert_model ./mock_distilbert ...
 ```
 
-For real experiments, a CUDA-enabled GPU is strongly recommended.
+## 12. Additional Experiment — 50 Clients with 20% Participation
+
+This experiment evaluates GoFed in a larger federated setting consisting of **50 clients**, where only **20% of clients participate in each communication round**.
+
+### Experimental Configuration
+
+| Parameter                  | Value                |
+| -------------------------- | -------------------- |
+| Number of clients          | 50                   |
+| Participation ratio (κ)    | 0.20                 |
+| Clients selected per round | 10                   |
+| Local epochs               | 3                    |
+| Global rounds              | User-defined         |
+| Task setting               | Similar or Multitask |
+| Global evaluation          | Centralized test set |
+
+---
+
+### Dataset Directory Structure
+
+For this experiment, the dataset directory should be organized as follows:
+
+```text
+noniid/
+├── Train/
+│   ├── Client_1/
+│   ├── Client_2/
+│   ├── Client_3/
+│   ├── ...
+│   └── Client_50/
+│
+└── Test/
+    ├── Client_1/
+    ├── Client_2/
+    ├── Client_3/
+    ├── ...
+    ├── Client_50/
+    └── Centralized.csv
+```
+
+#### Description
+
+* `Train/Client_i/` contains the local training data for client *i*.
+* `Test/Client_i/` contains the local test data for client *i* used to compute Local Classifier Accuracy (LCA).
+* `Test/Centralized.csv` is the global evaluation dataset used after each federated round to measure overall model performance.
+
+---
+
+### Running the 50-Client Experiment
+
+Example command:
+
+```bash
+python gofed.py \
+    --data_dir              noniid              \
+    --output_dir            results/50clients   \
+    --num_clients           50                  \
+    --participation_ratio   0.20                \
+    --num_local_epochs      3                   \
+    --device                cuda
+```
+
+With `--participation_ratio 0.20` and `--num_clients 50`, GoFed randomly selects **10 clients per round** for local training and federated aggregation. Each selected client performs **3 local training epochs** before participating in the communication process. Global model performance is evaluated using `noniid/Test/Centralized.csv`.
+
