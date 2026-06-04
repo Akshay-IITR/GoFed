@@ -13,8 +13,8 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from transformers import AutoTokenizer, AutoModel
-from sklearn.metrics import accuracy_score, f1_score
+from transformers import AutoTokenizer, AutoModel, DistilBertConfig, DistilBertModel
+from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s", datefmt="%H:%M:%S",)
 logger = logging.getLogger("GoFed")
@@ -53,10 +53,8 @@ class BERTBiLSTMClassifier(nn.Module):
         try:
             self.bert = AutoModel.from_pretrained(bert_model_name)
         except Exception:
-            from transformers import DistilBertConfig, DistilBertModel
             cfg = DistilBertConfig.from_pretrained(bert_model_name)
             self.bert = DistilBertModel(cfg)
-        # Freeze BERT – only BiLSTM is trained and communicated
         for param in self.bert.parameters():
             param.requires_grad = False
 
@@ -124,22 +122,20 @@ def bilstm_param_size_mb(model: BERTBiLSTMClassifier) -> float:
 #-------------------------------------------------------
 # Energy calculation (Section 3.2)
 #-------------------------------------------------------
-def compute_computation_energy(workload_flops: float, cpu_freq_ghz: float = 2.2, gpu_freq_ghz: float = 1.395, cpu_flops_per_cycle: float = 8.0,
-    gpu_flops_per_cycle: float = 128.0, phi_cpu: float = 2.3e-29, phi_gpu: float = 2.3e-29, n_sm: int = 84,) -> float:
+def compute_computation_energy(computation_time_s: float, cpu_freq_ghz: float = 2.2, gpu_freq_ghz: float = 1.395,
+    phi_cpu: float = 2.3e-29, phi_gpu: float = 2.3e-29, n_sm: int = 84,) -> float:
     """
-    Computation energy per client per round, Eq. 3-4 from the paper.
-        t_cp = max(W / speed_cpu, W / speed_gpu)                  (Eq. 3)
+    Computation energy per client per round using ACTUAL measured computation time.
+
         E_cp = (phi_cpu * f_cpu^3 + phi_prime * f_gpu^3) * t_cp   (Eq. 4)
 
-    where phi * f^3 represents effective power consumption (W) and t_cp is the FLOPs-derived computation time (seconds).
+    Here t_cp is the measured local-training computation time (seconds), replacing the
+    previous FLOPs-derived approximation from Eq. 3 so the simulation reflects runtime.
     """
     f_cpu = cpu_freq_ghz * 1e9
     f_gpu = gpu_freq_ghz * 1e9
-    speed_cpu = f_cpu * cpu_flops_per_cycle      # FLOP/s for CPU
-    speed_gpu = f_gpu * gpu_flops_per_cycle      # FLOP/s for GPU
-    t_cp      = max(workload_flops / speed_cpu, workload_flops / speed_gpu)   # Eq. 3
     phi_prime = n_sm * phi_gpu                   # aggregate SM coefficient
-    E_cp = (phi_cpu * f_cpu ** 3 + phi_prime * f_gpu ** 3) * t_cp     # Eq. 4
+    E_cp = (phi_cpu * f_cpu ** 3 + phi_prime * f_gpu ** 3) * computation_time_s
     return E_cp
 
 def compute_communication_energy(
@@ -157,11 +153,6 @@ def compute_communication_energy(
 
     The closed-form in Eq. 7 of the paper,
         E_cm = B * t_cm * (N0/h^2) * (2^(M/(B*t_cm)) - 1),
-    is algebraically identical:
-        2^(M/(B*t_cm)) - 1  =  2^(R/B) - 1  =  SNR  =  P_tx*h^2/N0
-        => E_cm = B*t_cm*(N0/h^2)*P_tx*h^2/N0 = B*t_cm*P_tx
-    but B*t_cm = M*B/R which contains M (~11M bits) making the intermediate value huge despite the final result being small.  We therefore use the
-    equivalent and numerically stable form  E_cm = P_tx * t_cm  directly.
     """
     snr       = tx_power_w * (channel_gain ** 2) / noise_psd
     data_rate = bandwidth_hz * math.log2(1.0 + snr)   # bits/s  (Eq. 6)
@@ -169,9 +160,6 @@ def compute_communication_energy(
     E_cm      = tx_power_w * t_cm
     return E_cm
 
-# ─────────────────────────────────────────────
-# Training / evaluation helpers
-# ─────────────────────────────────────────────
 def train_one_epoch(model, dataloader, optimizer, criterion, device):
     model.train()
     total_loss = 0.0
@@ -202,6 +190,22 @@ def evaluate(model, dataloader, device):
     acc = accuracy_score(all_labels, all_preds)
     f1 = f1_score(all_labels, all_preds, average="weighted", zero_division=0)
     return acc, f1
+
+@torch.no_grad()
+def evaluate_with_confusion_matrix(model, dataloader, device):
+    model.eval()
+    all_preds, all_labels = [], []
+    for input_ids, attention_mask, labels in dataloader:
+        input_ids = input_ids.to(device)
+        attention_mask = attention_mask.to(device)
+        preds = model(input_ids, attention_mask)
+        predicted = (preds.cpu().numpy() > 0.5).astype(int)
+        all_preds.extend(predicted.tolist())
+        all_labels.extend(labels.numpy().tolist())
+    acc = accuracy_score(all_labels, all_preds)
+    f1 = f1_score(all_labels, all_preds, average="weighted", zero_division=0)
+    cm = confusion_matrix(all_labels, all_preds, labels=[0, 1])
+    return acc, f1, cm
 
 class GoFedServer:
     """
@@ -299,17 +303,18 @@ class MetricsLogger:
         client_lca_headers = [f"LCA_client_{i+1}" for i in range(n_clients)]
         client_sent_headers = [f"sent_update_client_{i+1}" for i in range(n_clients)]
         self.summary_headers = (
-            ["round", "global_accuracy", "global_f1", "comm_overhead_MB", "total_energy_J", "num_clients_sent_update"] + client_lca_headers + client_sent_headers)
+            ["round", "global_accuracy", "global_f1", "comm_overhead_MB", "total_energy_J", "round_computation_time_s", "round_communication_time_s", "num_clients_sent_update"] + client_lca_headers + client_sent_headers)
         with open(self.summary_path, "w", newline="") as f:
             csv.writer(f).writerow(self.summary_headers)
 
         self.detail_path = os.path.join(output_dir, "gofed_client_details.csv")
         with open(self.detail_path, "w", newline="") as f:
-            csv.writer(f).writerow(["round", "client_id", "current_lca", "best_lca", "sent_update", "comp_energy_J", "comm_energy_J"])
+            csv.writer(f).writerow(["round", "client_id", "current_lca", "best_lca", "sent_update", "training_time_s", "comp_energy_J", "comm_energy_J"])
 
         self.n_clients = n_clients
 
     def log_round(self, round_num: int, global_acc: float, global_f1: float, comm_overhead_mb: float, total_energy: float,
+        round_computation_time_s: float, round_communication_time_s: float,
         num_sent: int, lca_per_client: dict, sent_per_client: dict, client_details: list,):
         # Summary row
         n = self.n_clients
@@ -318,7 +323,8 @@ class MetricsLogger:
 
         row = (
             [round_num, round(global_acc, 6), round(global_f1, 6),
-             round(comm_overhead_mb, 4), round(total_energy, 6), num_sent]
+             round(comm_overhead_mb, 4), round(total_energy, 6),
+             round(round_computation_time_s, 6), round(round_communication_time_s, 6), num_sent]
             + [round(v, 6) if not math.isnan(v) else "" for v in lca_vals]
             + sent_vals
         )
@@ -330,11 +336,12 @@ class MetricsLogger:
             writer = csv.writer(f)
             for d in client_details:
                 writer.writerow([round_num, d["client_id"], round(d["current_lca"], 6), round(d["best_lca"], 6), int(d["sent_update"]),
-                    round(d["comp_energy"], 6), round(d["comm_energy"], 6),])
+                    round(d["training_time_s"], 6), round(d["comp_energy"], 6), round(d["comm_energy"], 6),])
 
         logger.info(
             f"Round {round_num:3d} | GlobalAcc={global_acc:.4f} | "
-            f"CommOverhead={comm_overhead_mb:.2f}MB | Energy={total_energy:.4f}J | "
+            f"CommOverhead={comm_overhead_mb:.2f}MB | "
+            f"CompTime={round_computation_time_s:.2f}s | CommTime={round_communication_time_s:.2f}s | "
             f"ClientsSent={num_sent}"
         )
 
@@ -489,8 +496,6 @@ def main():
     param_bits = bilstm_param_size_bits(clients[0].model)
     param_mb   = bilstm_param_size_mb(clients[0].model)
     logger.info(f"BiLSTM param size: {param_mb:.4f} MB ({param_bits} bits)")
-    num_bilstm_params = sum(p.numel() for n, p in clients[0].model.named_parameters() if not n.startswith("bert."))
-    flops_per_sample = num_bilstm_params * 2  # rough estimate
 
     logger.info(f"\n{'='*60}")
     logger.info(f"Starting GoFed: {args.num_rounds} rounds, {args.num_clients} clients")
@@ -519,28 +524,30 @@ def main():
         total_comm_mb     = 0.0
         total_energy_j    = 0.0
         clients_sent      = 0
+        client_training_times = []
+        client_train_finish_times = []
+        round_comm_energy = 0.0
 
         for client in selected_clients:
             t0 = time.time()
 
             # Step 2: Local training
             client.local_train(args.num_local_epochs)
-
-            t_local = time.time() - t0
+            training_time_s = time.time() - t0
+            client_training_times.append(training_time_s)
+            client_train_finish_times.append(time.time())
 
             # Step 3: Evaluate --> LCA
             lca = client.compute_lca()
             lca_per_client[client.client_id] = lca
-            logger.info(f"  {client.client_id}: LCA={lca:.4f} (best={client.best_lca:.4f})")
+            logger.info(f"  {client.client_id}: LCA={lca:.4f} (best={client.best_lca:.4f}) | train_time={training_time_s:.2f}s")
 
             # Step 4-5: Decide whether to send update
             send_update = client.should_send_update(t)
             sent_per_client[client.client_id] = send_update
 
-            # Computation energy ──
-            dataset_size = client.data_size
-            workload = flops_per_sample * dataset_size * args.num_local_epochs
-            comp_energy = compute_computation_energy(workload_flops=workload, cpu_freq_ghz=args.cpu_freq_ghz, gpu_freq_ghz=args.gpu_freq_ghz,)
+            comp_energy = compute_computation_energy(computation_time_s=training_time_s, cpu_freq_ghz=args.cpu_freq_ghz,
+                gpu_freq_ghz=args.gpu_freq_ghz, phi_cpu=args.phi_cpu, phi_gpu=args.phi_gpu, n_sm=args.n_sm,)
             total_energy_j += comp_energy
 
             # Communication energy & overhead
@@ -558,7 +565,13 @@ def main():
                 logger.info(f"  {client.client_id}: No update sent (LCA not improved)")
 
             client_details.append({"client_id": client.client_id, "current_lca": lca, "best_lca": client.best_lca, "sent_update": send_update,
-                "comp_energy": comp_energy, "comm_energy": comm_energy,})
+                "training_time_s": training_time_s, "comp_energy": comp_energy, "comm_energy": comm_energy,})
+
+            round_comm_energy+=comm_energy
+
+        round_computation_time_s = max(client_training_times) if client_training_times else 0.0
+        aggregation_start_time = time.time()
+        round_communication_time_s = aggregation_start_time - max(client_train_finish_times) if client_train_finish_times else 0.0
 
         # Step 6-8: Server aggregation
         aggregated_params = server.aggregate(selected_ids)
@@ -566,18 +579,24 @@ def main():
         # Communication overhead (paper Eq. 17 / 19), uplink  = clients_sent x param_mb  (already in total_comm_mb)
         # Mglobal = param_mb x 1  (one global model broadcast, counted once)
         total_comm_mb += param_mb   # Mglobal: one broadcast per round
-
-        # Downlink energy (server --> clients) and server computation energy are NOT included in E_tot per paper Eq. 15, which sums
-        # only client-side E_cp_i (local training) + E_cm_i (uplink when LCA improves). Downlink and server costs are excluded.
-        # Evaluate on centralized test (global model)
         global_eval_model.set_bilstm_state_dict(aggregated_params)
         global_acc, global_f1 = evaluate(global_eval_model, central_loader, device)
         logger.info(f"  Global accuracy: {global_acc:.4f}  F1: {global_f1:.4f}")
-        logger.info(f"  Comm overhead: {total_comm_mb:.2f} MB | Energy: {total_energy_j:.4f} J")
+        logger.info(f"  Comm overhead: {total_comm_mb:.2f} MB | Communication Energy: {round_comm_energy:.4f} J")
+        logger.info(f"  Round computation time: {round_computation_time_s:.2f} s | Round communication time: {round_communication_time_s:.2f} s")
 
         # Log metrics
         metrics_logger.log_round(round_num=t, global_acc=global_acc, global_f1=global_f1, comm_overhead_mb=total_comm_mb, total_energy=total_energy_j,
+            round_computation_time_s=round_computation_time_s, round_communication_time_s=round_communication_time_s,
             num_sent=clients_sent, lca_per_client=lca_per_client, sent_per_client=sent_per_client, client_details=client_details,)
+
+        if t == args.num_rounds:
+            logger.info("Final-round confusion matrices on each client's test dataset using the aggregated global model:")
+            for client in clients:
+                client_acc, client_f1, client_cm = evaluate_with_confusion_matrix(global_eval_model, client.test_loader, device)
+                logger.info(
+                    f"  {client.client_id}: accuracy={client_acc:.4f}, f1={client_f1:.4f}, confusion_matrix={client_cm.tolist()}"
+                )
 
     logger.info(f"\n{'='*60}")
     logger.info("GoFed training complete.")
