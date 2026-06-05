@@ -70,6 +70,7 @@ GoFed/
 ├── gofed.py                  # Main implementation — GoFed algorithm + model
 ├── requirements.txt          # Python package dependencies
 ├── README.md                 # This file
+│── centralized_test.csv  # global evaluation set
 │
 ├── Clients/                  # ← create this with your datasets
 │   ├── client_1/
@@ -80,10 +81,9 @@ GoFed/
 │   │   └── test.csv
 │   ├── ...
 │   ├── client_10/
-│   │   ├── train.csv
-│   │   └── test.csv
-│   └── centralized_test.csv  # global evaluation set
-│
+│       ├── train.csv
+│       └── test.csv
+│  
 └── results/                  # ← created automatically on first run
     ├── gofed_metrics.csv
     ├── gofed_client_details.csv
